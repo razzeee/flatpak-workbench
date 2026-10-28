@@ -1,0 +1,142 @@
+name: Czkawka acceptance
+
+# SDK downloads and a full Rust GUI build are intentionally opt-in initially.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: czkawka-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v4
+        with:
+          repository: qarmin/czkawka
+          ref: 93b0733075e5ab073b012e3cea26e60d195019b9
+          path: .ci/czkawka
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: flatpak/flatpak-builder-tools
+          ref: 9d86d336a39b9af38b86f114b6ce5820fe260f91
+          path: .ci/builder-tools
+          persist-credentials: false
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak dbus-daemon
+          rustup toolchain install 1.92.0 --profile minimal
+          rustup default 1.92.0
+          mkdir -p artifacts
+      - name: Install Builder and the reference runtime/SDK
+        run: |
+          sudo flatpak remote-add --system --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak install --system --noninteractive -y flathub \
+            org.flatpak.Builder org.gnome.Platform//49 org.gnome.Sdk//49
+          flatpak info --show-metadata org.gnome.Sdk//49 > artifacts/sdk-metadata.ini
+          extension_branch=$(python - <<'PY'
+          import configparser
+          config = configparser.ConfigParser(interpolation=None)
+          config.read('artifacts/sdk-metadata.ini')
+          # GNOME's Rust extension follows its Freedesktop base, not GNOME 49.
+          print(config['Extension org.freedesktop.Sdk.Extension']['version'])
+          PY
+          )
+          sudo flatpak install --system --noninteractive -y flathub "org.freedesktop.Sdk.Extension.rust-stable//$extension_branch"
+          flatpak info --show-commit "org.freedesktop.Sdk.Extension.rust-stable//$extension_branch" > artifacts/rust-extension-commit.txt
+          flatpak list --columns=ref,active > artifacts/installed-refs.txt
+      - name: Inspect and generate from upstream
+        run: |
+          python -m flatpak_workbench inspect .ci/czkawka > artifacts/inspection.json
+          bash examples/czkawka.sh "$PWD/.ci/czkawka" \
+            "$PWD/.ci/builder-tools/cargo/flatpak-cargo-generator.py" \
+            "$PWD/artifacts/packaging"
+      - name: Check deterministic generation
+        run: |
+          bash examples/czkawka.sh "$PWD/.ci/czkawka" \
+            "$PWD/.ci/builder-tools/cargo/flatpak-cargo-generator.py" \
+            "$RUNNER_TEMP/packaging-repeat"
+          for file in com.github.qarmin.czkawka.json cargo-sources.json provenance.json; do
+            cmp "artifacts/packaging/$file" "$RUNNER_TEMP/packaging-repeat/$file"
+          done
+      - name: Build and lint through the workbench
+        id: check
+        # Preserve a built artifact for smoke testing even when policy lint fails.
+        # The final verdict below still fails the job for any check failure.
+        continue-on-error: true
+        run: |
+          dbus-run-session -- python -m flatpak_workbench check \
+            artifacts/packaging/com.github.qarmin.czkawka.json \
+            --runs artifacts/checks | tee artifacts/check.json
+      - name: Export the successful build for smoke testing
+        id: bundle
+        if: ${{ !cancelled() && steps.check.outcome != 'skipped' }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+          result = json.loads(pathlib.Path('artifacts/check.json').read_text())
+          if result['build']['status'] != 'passed':
+              raise SystemExit('No successful build available for smoke testing')
+          repo = pathlib.Path(result['run_directory']) / 'repo'
+          subprocess.run([
+              'flatpak', 'build-bundle', str(repo), 'artifacts/czkawka.flatpak',
+              'com.github.qarmin.czkawka', 'master',
+              '--runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo',
+          ], check=True)
+          # The bundle is the smoke input; reclaim this run's compilation data
+          # before building the smoke container on a hosted runner.
+          for name in ('builddir', 'state'):
+              shutil.rmtree(pathlib.Path(result['run_directory']) / name)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('ready=true\n')
+          PY
+      - name: Build pinned smoke-test tooling
+        if: ${{ !cancelled() && steps.bundle.outputs.ready == 'true' }}
+        run: |
+          docker build -t workbench-smoke -f Containerfile \
+            https://github.com/razzeee/flatpak-smoke.git#c16708f020b7108eabbc6ce649097ceb417eefc9
+      - name: Smoke-test the GUI
+        if: ${{ !cancelled() && steps.bundle.outputs.ready == 'true' }}
+        uses: razzeee/flatpak-smoke@c16708f020b7108eabbc6ce649097ceb417eefc9
+        with:
+          image: workbench-smoke
+          bundle: artifacts/czkawka.flatpak
+          output: artifacts/smoke
+          allow-network-remotes: 'true'
+          user: nobody
+          args: --overall-timeout 10m
+          execution-timeout: '900'
+      - name: Preserve the build/lint verdict
+        if: ${{ !cancelled() && steps.check.outcome != 'success' }}
+        run: |
+          echo 'Build/lint did not pass; inspect the uploaded phase results.' >&2
+          exit 1
+      - name: Upload manifests, logs, and smoke results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: czkawka-acceptance-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            artifacts/**
+            !artifacts/checks/**/builddir/**
+            !artifacts/checks/**/repo/**
+            !artifacts/checks/**/state/**
+            !artifacts/czkawka.flatpak

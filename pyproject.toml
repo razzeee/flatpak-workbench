@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flatpak-workbench"
+version = "0.1.0"
+description = "Turn upstream checkouts into ordinary Flatpak manifests"
+requires-python = ">=3.11"
+
+[project.scripts]
+flatpak-workbench = "flatpak_workbench.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["flatpak_workbench"]

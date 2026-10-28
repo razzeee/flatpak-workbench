@@ -1,0 +1,10 @@
+__pycache__/
+*.egg-info/
+.venv/
+dist/
+.flatpak-builder/
+.workbench-runs/
+builddir/
+repo/
+.ci/
+artifacts/
